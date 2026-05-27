@@ -32,9 +32,12 @@ class MedSensingApp:
         self.last_pills = []     # 確保初始化 last_pills 變數
         
         # 💡 新增需求：異常次數計數、超時計時器與異常紀錄本
-        self.wrong_count = 0        # 累計拿錯藥的次數
+        self.wrong_count = 0        # 累計拿錯藥的次數（跨輪累積）
         self.wrong_start_time = 0   # 錯誤藥物持續留在畫面的起始時間點
         self.exception_logs = []    # 異常事件儲存陣列
+        
+        # 💡 新增：單輪內是否已經忽略過錯藥的旗標
+        self.wrong_ignored_this_round = False
         
         self.setup_ui()
         self.update_loop()
@@ -145,13 +148,10 @@ class MedSensingApp:
         btn_close = tk.Button(catalog, text="關閉圖鑑", font=("Microsoft JhengHei", 10), bg="#9E9E9E", fg="white", command=catalog.destroy)
         btn_close.pack(side=tk.BOTTOM, pady=10)
 
-    # 💡 舊版的彈窗提示函式功能已無使用，直接移除避免干擾
-
     def update_loop(self):
         if self.vid and self.vid.isOpened():
             ret, frame = self.vid.read()
             if ret:
-                # 💡 修正：不使用鏡像翻轉，恢復真實攝影機視角
                 h, w, _ = frame.shape
                 
                 # ----------------------------------------------------
@@ -161,55 +161,63 @@ class MedSensingApp:
                     results = self.models.pill_yolo(frame, conf=0.45, verbose=False)
                     all_boxes = results[0].boxes if results[0].boxes else []
                     
-                    state, res_val = self.pill_manager.process_multi_pills(frame, all_boxes, self.models)
+                    # 💡 修正點 1：如果是多輪累積 >= 2 次，才打從一開始就忽略。
+                    # 如果只是單輪內在等 8 秒，一開始先不忽略(傳 False)，這樣 managers 才會回傳 WARNING 讓我們計秒！
+                    should_ignore_wrong = self.wrong_ignored_this_round or self.wrong_count >= 3
                     
-                    # 💡 核心優化 2 & 3：錯誤藥物不彈窗、畫紅框提示、8秒強行放行、拿錯2次以上直接無視
+                    state, res_val = self.pill_manager.process_multi_pills(
+                        frame, all_boxes, self.models, ignore_wrong=should_ignore_wrong
+                    )
+                    
+                    # 💡 修正點 2：處理錯誤藥物計時與攔截邏輯
                     if state == "WARNING":
-                        box, msg = res_val  # 拆解錯誤藥物的座標與預設字串 "請將被框取藥品去除"
+                        box, msg = res_val  
                         
-                        if self.wrong_count >= 2:
-                            # 拿錯發生2次以上：裝作沒看到錯誤，將狀態轉為正常掃描
-                            state = "SCANNING"
-                            res_val = "偵測中... (已達2次拿錯限制，忽略異常並記錄)"
-                            if "已達2次拿錯限制，忽略此錯誤" not in self.exception_logs:
-                                self.exception_logs.append(f"[{time.strftime('%X')}] 異常提示：已拿錯藥2次以上，系統不再主動提醒，照常放行。")
+                        # 全新輪次的第一次拿錯，啟動 8 秒計時
+                        if self.wrong_start_time == 0:
+                            self.wrong_start_time = time.time()
+                            self.wrong_count += 1
+                            self.exception_logs.append(f"[{time.strftime('%X')}] 異常提示：偵測到錯誤藥物（累積第 {self.wrong_count} 次）。")
+                        
+                        elapsed = time.time() - self.wrong_start_time
+                        
+                        if elapsed >= 5.0:
+                            # 💡 只有在這裡，真的撐過 8 秒了，才開通「單輪忽略」！
+                            self.wrong_ignored_this_round = True
+                            self.exception_logs.append(f"[{time.strftime('%X')}] 異常強制：錯誤藥物滯留超時 8 秒，病人未移除，本輪強制忽略該異常並繼續核對。")
+                            
+                            # 這一幀手動把計時器歸零，下一幀 loop 進來時 should_ignore_wrong 就會是 True，直接解鎖卡死
+                            self.wrong_start_time = 0
                         else:
-                            # 拿錯在2次以內：開始進行 8 秒計時與紅框鎖定
-                            if self.wrong_start_time == 0:
-                                self.wrong_start_time = time.time()
-                                self.wrong_count += 1
-                                self.exception_logs.append(f"[{time.strftime('%X')}] 異常提示：偵測到錯誤藥物（第 {self.wrong_count} 次）。")
-                            
-                            elapsed = time.time() - self.wrong_start_time
-                            
-                            if elapsed >= 8.0:
-                                # 撐過 8 秒，強制放行
-                                self.exception_logs.append(f"[{time.strftime('%X')}] 異常強制：錯誤藥物滯留超時 8 秒，病人未移除，系統執行強制通關。")
-                                self.last_pills = [m for m in self.target_meds if m not in self.completed_meds]
-                                self.lbl_tip.config(text="【提示】[異常超時放行] 進入服藥動作辨識...", fg="green")
-                                self.mode = "MATCH_DELAY"
-                                self.wrong_start_time = 0
-                                self.window.after(2000, self.transition_to_action_mode)
-                            else:
-                                # 8 秒內：框紅框，提示去除
-                                remaining_sec = int(8.0 - elapsed) + 1
-                                self.lbl_tip.config(text=f"【提示】{msg} (剩餘 {remaining_sec} 秒後強制放行)", fg="red")
-                                if box:
-                                    cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]), (0, 0, 255), 3) # 紅框
+                            # 8 秒之內：老老實實畫紅框、倒數計秒！
+                            remaining_sec = int(5.0 - elapsed) + 1
+                            self.lbl_tip.config(text=f"【提示】{msg} (剩餘 {remaining_sec} 秒後強制放行)", fg="red")
+                            if box:
+                                cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]), (0, 0, 255), 3) # 紅框
                     
-                    # 若畫面中沒有錯誤藥物，則歸零本次的超時計時器（不影響計數次數）
+                    # 如果多輪累積 >=2 次，或者是超時後自動放行，補登錄日誌
+                    if should_ignore_wrong and state == "WARNING":
+                        if self.wrong_count >= 2 and "多輪累積達 2 次限制" not in "".join(self.exception_logs):
+                            self.exception_logs.append(f"[{time.strftime('%X')}] 異常提示：多輪累積拿錯藥已達 {self.wrong_count} 次，系統直接忽略。")
+                    
+                    # 若畫面中沒有錯誤藥物（例如病人自己拿走了），歸零超時計時器
                     if state != "WARNING":
                         self.wrong_start_time = 0
 
-                    # 💡 核心優化 1：需要翻面的藥品框起來，提示字更改為指定語句
+                    # ----------------------------------------------------
+                    # 常規辨識流程（當超時放行或累積達標後，state 就會順利走入這裡）
+                    # ----------------------------------------------------
                     if state == "NEED_FLIP":
                         box, _ = res_val
-                        self.lbl_tip.config(text="【提示】請將被框取藥品翻面", fg="magenta") # 改成指定提示字
+                        self.lbl_tip.config(text="【提示】請將被框取藥品翻面", fg="magenta") 
                         if box: 
                             cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]), (0, 165, 255), 3) # 橘框
                             
                     elif state == "SCANNING":
-                        self.lbl_tip.config(text=f"【提示】{res_val}", fg="orange")
+                        if should_ignore_wrong:
+                            self.lbl_tip.config(text=f"【提示】{res_val} (已忽略錯藥異常)", fg="orange")
+                        else:
+                            self.lbl_tip.config(text=f"【提示】{res_val}", fg="orange")
                         
                     elif state == "MATCHED":
                         if isinstance(res_val, tuple):
@@ -217,8 +225,6 @@ class MedSensingApp:
                         else:
                             self.last_pills = res_val
                             display_text = f"已識別特徵: {' + '.join(self.last_pills)}"
-                        
-                        # 💡 徹底移除：删除了原本直接用 draw_chinese_text 畫在視訊畫面上的大綠字
                         
                         self.lbl_tip.config(text=f"【提示】{display_text}", fg="green")
                         
@@ -242,7 +248,6 @@ class MedSensingApp:
                                 self.completed_meds.append(p)
                         self.refresh_med_list_ui()
                         
-                        # 💡 終點日誌輸出：在每一次完全吃完藥時，列印本次累計的所有異常事件到終端機上
                         if self.exception_logs:
                             print("\n=== 🧠 本輪服藥異常狀況紀錄公報 ===")
                             for log in self.exception_logs:
@@ -277,8 +282,9 @@ class MedSensingApp:
         
         self.pill_manager = PillDecisionManager(self.target_meds, self.completed_meds)
         
-        # 每一次切回後鏡頭重新對藥，清空超時計時器（讓 wrong_count 保留繼續跨藥物累加次數）
+        # 💡 新一輪重置：單輪忽略旗標重置，超時計時重置，但自我累積的 wrong_count 保留！
         self.wrong_start_time = 0
+        self.wrong_ignored_this_round = False
         
         if not self.pill_manager.remaining_targets:
             self.mode = "IDLE"
